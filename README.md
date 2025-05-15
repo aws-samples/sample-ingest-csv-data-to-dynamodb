@@ -1,17 +1,5 @@
-## My Project
+This repository contains the code for a 2 part blog series that covers ingesting CSV data into Amazon DynamoDB. Supporting code and instructions are in their respective folders based on service. The blog covers how you can use AWS Lambda for small to medium size datasets or Glue for any size.
 
-TODO: Fill this README out!
+[Ingest CSV data to Amazon DynamoDB using AWS Lambda](https://aws.amazon.com/blogs/database/ingest-csv-data-to-amazon-dynamodb-using-aws-lambda/)
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
-
-## Security
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
-
-## License
-
-This library is licensed under the MIT-0 License. See the LICENSE file.
-
+Ingest CSV data to Amazon DynamoDB using AWS Glue... COMING SOON
