@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for CSV to DynamoDB ingestion solution using AWS Glue. Resources named with Stack ID UUID. Configured to trigger Glue Workflow.'
+
+Resources:
+  # 1. S3 bucket for CSV data, appended with Stack ID UUID
+  CsvDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - 'csv-to-ddb-glue'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      # DeletionPolicy: Retain # Uncomment for production to prevent accidental deletion
+
+  # 2. DynamoDB Table for ingested CSV data, appended with Stack ID UUID
+  IngestedCsvDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+        - '-'
+        - - 'ingested-csv-data'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: account
+          AttributeType: S
+        - AttributeName: offer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: account
+          KeyType: HASH
+        - AttributeName: offer_id
+          KeyType: RANGE
+
+  # 3. IAM Role for Glue Job execution, appended with Stack ID UUID
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - 'GlueJobRole'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "glue.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        - PolicyName: "GlueS3DynamoDBAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "events:PutTargets"
+                  - "events:PutRule"
+                  - "events:DescribeRule"
+                Resource: "*" # Note: Broad permissions, consider scoping down in production.
+
+  # 9. Lambda function role to upload script to S3, appended with Stack ID UUID
+  ScriptUploaderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - 'ScriptUploaderLambdaRole'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${CsvDataBucket}"
+                  - !Sub "arn:aws:s3:::${CsvDataBucket}/*"
+
+  # 10. Lambda function to upload script to S3, appended with Stack ID UUID
+  ScriptUploaderLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CsvDataBucket
+    Properties:
+      FunctionName: !Join
+        - '-'
+        - - 'ScriptUploaderLambda'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Handler: index.handler
+      Role: !GetAtt ScriptUploaderLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info("Received event: %s", event)
+              status = cfnresponse.SUCCESS
+              response_data = {}
+              physical_resource_id = event.get('PhysicalResourceId') # Ensure physical_resource_id is handled
+
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  s3 = boto3.client('s3')
+                  
+                  script_path = 'scripts/etl_job.py'
+                  raw_csv_path = 'raw-csv-files/README.txt'
+                  
+                  request_type = event['RequestType']
+                  logger.info("Request type: %s", request_type)
+
+                  if request_type == 'Create' or request_type == 'Update':
+                      logger.info(f"Bucket name: {bucket_name}")
+
+                      script_content = '''import sys
+          from pyspark.context import SparkContext
+          from awsglue.context import GlueContext
+          from awsglue.job import Job
+          from awsglue.utils import getResolvedOptions
+          from awsglue.transforms import *
+
+          args = getResolvedOptions(sys.argv, ['JOB_NAME', 'INPUT_S3_PATH', 'OUTPUT_DDB_TABLE'])
+
+          sc = SparkContext.getOrCreate()
+          glueContext = GlueContext(sc)
+          job = Job(glueContext)
+          job.init(args['JOB_NAME'], args)
+
+          # Read CSV data
+          dyf = glueContext.create_dynamic_frame.from_options(
+              connection_type = "s3",
+              connection_options = {"paths": [args['INPUT_S3_PATH']]},
+              format = "csv",
+              format_options = {"withHeader": True},
+              transformation_ctx="datasource1"
+          )
+
+          # Filter out rows where account or offer_id are null/empty
+          def filter_nulls(rec):
+              return rec["account"] is not None and rec["account"] != "" and rec["offer_id"] is not None and rec["offer_id"] != ""
+
+          filtered_dyf = Filter.apply(frame = dyf, f = filter_nulls, transformation_ctx = "filtered_dyf")
+
+          # Convert key fields to strings to ensure compatibility with DynamoDB
+          def convert_keys_to_string(rec):
+              rec["account"] = str(rec["account"])
+              rec["offer_id"] = str(rec["offer_id"])
+              return rec
+
+          transformed_dyf = Map.apply(frame = filtered_dyf, f = convert_keys_to_string, transformation_ctx = "transformed_dyf")
+
+          # Write to DynamoDB
+          glueContext.write_dynamic_frame.from_options(
+              frame = transformed_dyf,
+              connection_type = "dynamodb",
+              connection_options = {
+                  "dynamodb.output.tableName": args['OUTPUT_DDB_TABLE'],
+                  "dynamodb.throughput.write.percent": "1"
+              },
+              transformation_ctx="datasink1"
+          )
+
+          job.commit()'''
+
+                      readme_content = '''This directory is where you should upload your CSV files for processing.
+          Files uploaded here will automatically trigger the Glue workflow to process them and load the data into DynamoDB.
+          
+          CSV files should have a header row with the following column names:
+          - account (will be used as the primary key)
+          - offer_id (will be used as the sort key)
+          - ... (other columns will be added as attributes)
+          '''
+
+                      logger.info(f"Creating script file at s3://{bucket_name}/{script_path}")
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=script_path,
+                          Body=script_content,
+                          ContentType='text/plain'
+                      )
+                      logger.info(f"Successfully uploaded ETL script to s3://{bucket_name}/{script_path}")
+
+                      logger.info(f"Creating README file at s3://{bucket_name}/{raw_csv_path}")
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=raw_csv_path,
+                          Body=readme_content,
+                          ContentType='text/plain'
+                      )
+                      logger.info(f"Successfully created README file at s3://{bucket_name}/{raw_csv_path}")
+                      
+                      response = s3.list_objects_v2(Bucket=bucket_name)
+                      if 'Contents' in response:
+                          logger.info(f"Current objects in bucket:")
+                          for obj in response['Contents']:
+                              logger.info(f"  - {obj['Key']}")
+                      else:
+                          logger.warning(f"No objects found in bucket {bucket_name}")
+                      
+                      # Set physical_resource_id for Create/Update
+                      physical_resource_id = f"s3://{bucket_name}/custom-resource-marker" 
+                      response_data['Message'] = "Resources created/updated successfully"
+
+                  elif request_type == 'Delete':
+                      # For delete requests, ensure cleanup only if physical_resource_id is present
+                      if physical_resource_id: # Only attempt delete if the resource was successfully created
+                          try:
+                              s3.delete_object(
+                                  Bucket=bucket_name,
+                                  Key=script_path
+                              )
+                              s3.delete_object(
+                                  Bucket=bucket_name,
+                                  Key=raw_csv_path
+                              )
+                              logger.info(f"Successfully cleaned up S3 objects during delete operation for {physical_resource_id}")
+                          except Exception as e:
+                              logger.warning(f"Cleanup warning for {physical_resource_id}: {str(e)}")
+                      else:
+                          logger.info("Skipping S3 object deletion as PhysicalResourceId was not set (likely Create failed).")
+                      response_data['Message'] = "Delete request processed."
+
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  status = cfnresponse.FAILED
+                  response_data['Error'] = str(e)
+              
+              finally:
+                  logger.info("Sending response: %s", status)
+                  cfnresponse.send(event, context, status, response_data, physicalResourceId=physical_resource_id)
+
+  # 11. Custom Resource to trigger the Lambda function for script upload
+  UploadScript:
+    Type: Custom::ScriptUploader
+    DependsOn:
+      - CsvDataBucket
+      - ScriptUploaderLambda
+    Properties:
+      ServiceToken: !GetAtt ScriptUploaderLambda.Arn
+      BucketName: !Ref CsvDataBucket
+
+  # 4. Glue ETL Job Definition, appended with Stack ID UUID
+  CsvToDdbGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: UploadScript 
+    Properties:
+      Name: !Join
+        - '-'
+        - - 'csv-to-ddb-processor'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: "glueetl"
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${CsvDataBucket}/scripts/etl_job.py"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--OUTPUT_DDB_TABLE": !Ref IngestedCsvDataTable
+        "--INPUT_S3_PATH": !Sub "s3://${CsvDataBucket}/raw-csv-files/"
+        "--JOB_NAME": !Join # This should ideally reference the job's own name if used for self-reference in logs/metrics
+          - '-'
+          - - 'csv-to-ddb-processor'
+            - !Sub
+              - '${StackIdSuffix}'
+              - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-continuous-log-filter": "true"
+        "--enable-metrics": "true"
+      GlueVersion: "5.0"
+      NumberOfWorkers: 2
+      WorkerType: "G.1X"
+
+  # 5. Glue Workflow definition
+  CsvToDdbWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Join
+        - '-'
+        - - 'csv-toddb-glue'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Description: "Workflow for processing CSV files to DynamoDB"
+      DefaultRunProperties:
+        "--batch-size": "900" # Note: These are workflow default run properties.
+        "input_s3_path": !Sub "s3://${CsvDataBucket}/raw-csv-files/"
+        "output_ddb_table": !Ref IngestedCsvDataTable
+
+  # Single Glue Job trigger within the workflow
+  GlueJobTrigger:
+    Type: AWS::Glue::Trigger
+    DependsOn:
+      - CsvToDdbWorkflow
+      - CsvToDdbGlueJob
+    Properties:
+      Name: !Join
+        - '-'
+        - - 'csv-to-ddb-job-trigger'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      Type: "EVENT" 
+      WorkflowName: !Ref CsvToDdbWorkflow
+      Actions:
+        - JobName: !Ref CsvToDdbGlueJob
+          # Arguments removed since they're already defined in job's DefaultArguments
+
+  # 6. EventBridge Role for triggering Glue Workflow
+  EventBridgeGlueRole:         # Logical ID
+    Type: AWS::IAM::Role       # Type
+    Properties:                # Properties of the Role
+      RoleName: !Join
+        - '-'
+        - - 'EventBridgeGlueRole'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:                # <-- This is correctly indented under Properties
+        - PolicyName: GlueWorkflowTriggerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ActionsForResource
+                Effect: Allow
+                Action: glue:notifyEvent # This was 'Action: - glue:notifyEvent' in your snippet, both are valid ways to list actions
+                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/${CsvToDdbWorkflow}"
+
+  # 7. EventBridge Rule to connect S3 events to the Glue workflow
+  CsvUploadEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Join
+        - '-'
+        - - 'csv-to-ddb-trigger'
+          - !Sub
+            - '${StackIdSuffix}'
+            - StackIdSuffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref CsvDataBucket
+          object:
+            key: # This structure correctly matches if the object key starts with "raw-csv-files/"
+              - prefix: "raw-csv-files/"
+      State: "ENABLED"
+      Targets:
+        - Id: GlueWorkflowTarget
+          Arn: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:workflow/${CsvToDdbWorkflow}"
+          RoleArn: !GetAtt EventBridgeGlueRole.Arn
+          # No InputTransformer - passing the entire event directly
+
+Outputs:
+  BucketName:
+    Description: "S3 bucket for CSV files"
+    Value: !Ref CsvDataBucket
+  S3UploadLocation:
+    Description: "Location to upload CSV files for processing"
+    Value: !Sub "s3://${CsvDataBucket}/raw-csv-files/"
+  DynamoDBTableName:
+    Description: "DynamoDB table for ingested CSV data"
+    Value: !Ref IngestedCsvDataTable
+  GlueWorkflowName:
+    Description: "Glue Workflow Name"
+    Value: !Ref CsvToDdbWorkflow
+  GlueJobName:
+    Description: "Glue Job Name"
+    Value: !Ref CsvToDdbGlueJob
