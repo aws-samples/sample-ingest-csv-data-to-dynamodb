@@ -314,7 +314,7 @@ Resources:
         "--enable-continuous-log-filter": "true"
         "--enable-metrics": "true"
       GlueVersion: "5.0"
-      NumberOfWorkers: 2
+      NumberOfWorkers: 10
       WorkerType: "G.1X"
 
   # 5. Glue Workflow definition
