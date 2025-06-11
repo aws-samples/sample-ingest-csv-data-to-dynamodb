@@ -41,7 +41,8 @@ CSV Upload → S3 → EventBridge → Glue Workflow → Glue Job → DynamoDB
 aws cloudformation create-stack \
   --stack-name csv-glue-pipeline \
   --template-body file://csv-to-ddb-glue.yaml \
-  --capabilities CAPABILITY_NAMED_IAM
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides NotificationEmail=<YOUR EMAIL ADDRESS HERE>
 ```
 
 ### 2. Get the S3 Upload Location
